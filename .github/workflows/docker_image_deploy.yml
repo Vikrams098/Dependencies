@@ -132,7 +132,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.28.0
         with:
           image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:scan-target
           format: table
