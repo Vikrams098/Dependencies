@@ -1,0 +1,298 @@
+name: Docker Image Deploy (Reusable)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reusable workflow — call from any other workflow via:
+#
+#   jobs:
+#     pipeline:
+#       uses: ./.github/workflows/docker-image-deploy.yml
+#       with:
+#         image_name: your-image-name
+#         container_name: your-container-name
+#       secrets: inherit
+#
+# Inputs:
+#   image_name      — Docker Hub repo name without username  (e.g. kvs-cafe)
+#   container_name  — Name of the container on EC2           (e.g. kvs-cafe-app)
+#
+# Secrets expected (pass via `secrets: inherit` or map explicitly):
+#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+#   EC2_HOST, EC2_USER, EC2_SSH_KEY
+#   S3_DEPLOY_ACCESS_KEY, S3_DEPLOY_SECRET_KEY, AWS_REGION, S3_DEPLOY_BUCKET_NAME
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: Docker Hub image name without username (e.g. kvs-cafe)
+        required: true
+        type: string
+      container_name:
+        description: Container name used on the EC2 host (e.g. kvs-cafe-app)
+        required: true
+        type: string
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+      EC2_HOST:
+        required: true
+      EC2_USER:
+        required: true
+      EC2_SSH_KEY:
+        required: true
+      S3_DEPLOY_ACCESS_KEY:
+        required: true
+      S3_DEPLOY_SECRET_KEY:
+        required: true
+      AWS_REGION:
+        required: true
+      S3_DEPLOY_BUCKET_NAME:
+        required: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ── 1. Version ───────────────────────────────────────────────────────────────
+  version:
+    name: Generate Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.set.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: set
+        run: |
+          # If this commit already carries a semver tag, use it as-is
+          EXACT=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          if [ -n "$EXACT" ]; then
+            echo "version=${EXACT}" >> "$GITHUB_OUTPUT"
+            echo "Version: ${EXACT} (exact tag)"
+            exit 0
+          fi
+
+          # Most recent semver tag that is an ancestor of HEAD
+          LAST_TAG=$(git tag --merged HEAD --sort=-v:refname \
+                       | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+
+          if [ -z "$LAST_TAG" ]; then
+            VERSION="v1.0.0"
+          else
+            MAJOR=$(echo "$LAST_TAG" | sed 's/v\([0-9]*\)\..*/\1/')
+            MINOR=$(echo "$LAST_TAG" | sed 's/v[0-9]*\.\([0-9]*\)\..*/\1/')
+            PATCH=$(echo "$LAST_TAG" | sed 's/v[0-9]*\.[0-9]*\.\([0-9]*\)/\1/')
+
+            # Subject + body of every commit since the last tag
+            COMMITS=$(git log "${LAST_TAG}..HEAD" --pretty=format:"%s%n%b")
+
+            # Conventional-commit bump rules:
+            #   BREAKING CHANGE in body  OR  type(scope)!: subject → major
+            #   feat: / feat(scope):                                → minor
+            #   everything else (fix:, chore:, docs: …)            → patch
+            if echo "$COMMITS" | grep -qE '(BREAKING CHANGE:|^[a-z]+(\([^)]+\))?!:)'; then
+              BUMP="major"; MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+            elif echo "$COMMITS" | grep -qE '^feat(\([^)]+\))?:'; then
+              BUMP="minor"; MINOR=$((MINOR + 1)); PATCH=0
+            else
+              BUMP="patch"; PATCH=$((PATCH + 1))
+            fi
+
+            echo "Bump: ${BUMP} (${LAST_TAG} → v${MAJOR}.${MINOR}.${PATCH})"
+            VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${VERSION}"
+
+  # ── 2. Build · Scan · Push ───────────────────────────────────────────────────
+  build:
+    name: Build · Scan · Push
+    needs: version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Build locally first so Trivy can scan before the image is made public
+      - name: Build image for security scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:scan-target
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Block on CRITICAL/HIGH CVEs — image never reaches Docker Hub if this fails
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:scan-target
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+
+      # Push only after scan passes — tag :version AND :latest
+      - name: Push to Docker Hub
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:${{ needs.version.outputs.version }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:latest
+          cache-from: type=gha
+          provenance: true
+          sbom: true
+
+  # ── 3. Deploy to EC2 (with rollback) ─────────────────────────────────────────
+  deploy-ec2:
+    name: Deploy to EC2
+    needs: [version, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy with rollback
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DOCKERHUB_TOKEN:    ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKER_IMAGE:       ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}
+          IMAGE_TAG:          ${{ needs.version.outputs.version }}
+          CONTAINER_NAME:     ${{ inputs.container_name }}
+        with:
+          host:     ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key:      ${{ secrets.EC2_SSH_KEY }}
+          envs: DOCKERHUB_TOKEN,DOCKERHUB_USERNAME,DOCKER_IMAGE,IMAGE_TAG,CONTAINER_NAME
+          script: |
+            set -euo pipefail
+
+            OLD_CONTAINER="${CONTAINER_NAME}-old"
+            IMAGE="${DOCKER_IMAGE}:${IMAGE_TAG}"
+            APP_PORT="${APP_PORT:-3000}"
+
+            echo "==> Authenticating with Docker Hub"
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+            echo "==> Pulling ${IMAGE}"
+            docker pull "$IMAGE"
+
+            # ── Save current container as rollback point ──────────────────────
+            CURRENT_ID=$(docker ps -aq -f "name=^${CONTAINER_NAME}$")
+            if [ -n "$CURRENT_ID" ]; then
+              echo "==> Stopping ${CONTAINER_NAME} → saving as ${OLD_CONTAINER}"
+              docker stop "$CONTAINER_NAME"
+              docker rm -f "$OLD_CONTAINER" 2>/dev/null || true
+              docker rename "$CONTAINER_NAME" "$OLD_CONTAINER"
+            fi
+
+            # ── Start new container ───────────────────────────────────────────
+            echo "==> Starting ${CONTAINER_NAME}"
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              -p "${APP_PORT}:3000" \
+              --security-opt no-new-privileges:true \
+              --cap-drop ALL \
+              -v "${CONTAINER_NAME}-data:/app/data" \
+              -e NODE_ENV=production \
+              "$IMAGE"
+
+            # ── Poll Docker HEALTHCHECK (up to 40 s) ─────────────────────────
+            echo "==> Waiting for health check..."
+            HEALTHY=false
+            for i in $(seq 1 8); do
+              sleep 5
+              CSTATUS=$(docker inspect --format='{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "gone")
+              HSTATUS=$(docker inspect \
+                          --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+                          "$CONTAINER_NAME" 2>/dev/null || echo "gone")
+              echo "   attempt ${i}/8 — container: ${CSTATUS}, health: ${HSTATUS}"
+              if [ "$HSTATUS" = "healthy" ]; then HEALTHY=true; break; fi
+              if [ "$CSTATUS" != "running" ]; then
+                echo "   Container exited unexpectedly."; break
+              fi
+            done
+
+            # ── Success ───────────────────────────────────────────────────────
+            if [ "$HEALTHY" = "true" ]; then
+              echo "==> Deployment successful! ${IMAGE} is healthy."
+              docker logout; exit 0
+            fi
+
+            # ── Failure → rollback ────────────────────────────────────────────
+            echo "==> Health check failed — rolling back..."
+            docker stop "$CONTAINER_NAME" 2>/dev/null || true
+            docker rm   "$CONTAINER_NAME" 2>/dev/null || true
+
+            if [ -n "$CURRENT_ID" ]; then
+              docker rename "$OLD_CONTAINER" "$CONTAINER_NAME"
+              docker start  "$CONTAINER_NAME"
+              echo "==> Rollback complete — previous version restored as ${CONTAINER_NAME}."
+            else
+              echo "==> No previous container to restore."
+            fi
+
+            docker logout; exit 1
+
+  # ── 4. Deploy Frontend to S3 ─────────────────────────────────────────────────
+  deploy-s3:
+    name: Deploy to S3
+    needs: [version, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.S3_DEPLOY_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.S3_DEPLOY_SECRET_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Sync to S3
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          BUCKET:  ${{ secrets.S3_DEPLOY_BUCKET_NAME }}
+        run: |
+          echo "==> Deploying ${VERSION} to s3://${BUCKET}"
+
+          # Versioned archive — immutable snapshot, safe to keep forever
+          aws s3 sync ./frontend "s3://${BUCKET}/releases/${VERSION}/" \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --metadata "version=${VERSION},commit=${{ github.sha }},run=${{ github.run_number }}"
+
+          echo "    Archived: s3://${BUCKET}/releases/${VERSION}/"
+
+          # Live root — visitors hit this; releases/ prefix is never deleted
+          aws s3 sync ./frontend "s3://${BUCKET}/" \
+            --delete \
+            --exclude "releases/*" \
+            --cache-control "public, max-age=300" \
+            --metadata "version=${VERSION}"
+
+          echo "==> Live site updated to version ${VERSION}."
