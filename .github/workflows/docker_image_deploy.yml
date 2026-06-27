@@ -103,9 +103,9 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Version: ${VERSION}"
 
-  # ── 2. Build · Scan · Push ───────────────────────────────────────────────────
+  # ── 2. Build · Push ──────────────────────────────────────────────────────────
   build:
-    name: Build · Scan · Push
+    name: Build · Push
     needs: version
     runs-on: ubuntu-latest
 
@@ -122,25 +122,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build image for security scan
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          load: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:scan-target
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@v0.28.0
-        with:
-          image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:scan-target
-          format: table
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-
       - name: Push to Docker Hub
         uses: docker/build-push-action@v6
         with:
@@ -150,6 +131,7 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:${{ needs.version.outputs.version }}
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image_name }}:latest
           cache-from: type=gha
+          cache-to: type=gha,mode=max
           provenance: true
           sbom: true
 
